@@ -1,0 +1,5 @@
+numpy
+Pillow
+huggingface_hub
+einops
+safetensors
