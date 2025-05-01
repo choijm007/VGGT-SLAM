@@ -240,7 +240,57 @@ def _resize_pil_image(img, long_edge_size):
     new_size = tuple(int(round(x * long_edge_size / S)) for x in img.size)
     return img.resize(new_size, interp)
 
+def resize_img(
+        img,
+        size,                            # 224·448·512·518
+        square_ok=False,
+        return_transformation=False
+    ):
+    assert size in [224, 448, 512, 518]
+    MULT = 112                          # 14 and 16 both satisfied
 
+    # 1. numpy [0,1] → PIL
+    img = PIL.Image.fromarray(np.uint8(img * 255))
+    W1, H1 = img.size
+
+    # 2. resize (224: 짧은 변 맞춤, 그 밖: 긴 변 맞춤)
+    if size == 224:
+        img = _resize_pil_image(img, round(size * max(W1/H1, H1/W1)))
+    else:
+        img = _resize_pil_image(img, size)
+
+    W, H = img.size
+    cx, cy = W // 2, H // 2
+
+    # 3. 중앙 crop → H,W 모두 112의 배수
+    if size == 224:
+        half = (min(cx, cy) // MULT) * MULT
+        img = img.crop((cx-half, cy-half, cx+half, cy+half))
+    else:
+        halfw = (cx // MULT) * MULT
+        halfh = (cy // MULT) * MULT
+        if not square_ok and W == H:
+            halfh = int(0.75 * halfw)
+            halfh = (halfh // MULT) * MULT
+        img = img.crop((cx-halfw, cy-halfh, cx+halfw, cy+halfh))
+
+    res = dict(
+        img=ImgNorm(img)[None],                 # (1,3,H,W)
+        true_shape=np.int32([img.size[::-1]]),
+        unnormalized_img=np.asarray(img),
+    )
+
+    if return_transformation:
+        scale_w = W1 / W
+        scale_h = H1 / H
+        half_crop_w = (W - img.size[0]) / 2
+        half_crop_h = (H - img.size[1]) / 2
+        return res, (scale_w, scale_h, half_crop_w, half_crop_h)
+
+    return res
+
+
+'''
 def resize_img(img, size, square_ok=False, return_transformation=False):
     assert size == 224 or size == 512
     # numpy to PIL format
@@ -276,3 +326,4 @@ def resize_img(img, size, square_ok=False, return_transformation=False):
         return res, (scale_w, scale_h, half_crop_w, half_crop_h)
 
     return res
+'''

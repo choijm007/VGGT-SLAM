@@ -15,7 +15,6 @@ from mast3r_slam.mast3r_utils import mast3r_match_asymmetric
 import torch
 import time
 from vggt.models.vggt import VGGT
-from vggt.utils.load_fn import load_and_preprocess_images_cv2
 import einops
 import lietorch
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
@@ -151,9 +150,12 @@ class FrameTracker:
     def track_init(self, frame):
         with torch.no_grad():
             with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                
-                aggregated_tokens_list, ps_idx = self.vggt.aggregator(frame)
-            point_map, point_conf = self.vggt.point_head(aggregated_tokens_list, frame, ps_idx)
+                images = frame.img.unsqueeze(0)
+                print(images.shape)
+                #images = torch.cat([frame.img], dim=0) # (2,3,H,W)
+                aggregated_tokens_list, ps_idx = self.vggt.aggregator(images)
+                #aggregated_tokens_list, ps_idx = self.vggt.aggregator(frame.img)
+            point_map, point_conf = self.vggt.point_head(aggregated_tokens_list, images, ps_idx)
                 
         Xff_reduced = point_map[:, 0, :, :, :]
 
@@ -165,6 +167,7 @@ class FrameTracker:
         Cff = einops.rearrange(Cff_reduced, "b h w -> b (h w) 1")   # 결과: (1, H*W, 1)
         return Xff, Cff
     
+    '''
     def cam_param_to_sim3(self, param_tensor):
         """
         param_tensor: shape (9,) 텐서, 구성: [x, y, z, q1, q2, q3, q4, I1, I2]
@@ -182,9 +185,43 @@ class FrameTracker:
         # 4. lietorch.Sim3 객체 생성
         sim3 = lietorch.Sim3(translation=t, rotation=q, scale=scale)
         return sim3
+    '''
         
-    def track_vggt(self, frame: Frame):
+    def cam_param_to_sim3(self, param_tensor):
+        """
+        param_tensor: (9,) = [tx, ty, tz, qx, qy, qz, qw, I1, I2]
+        """
+        device, dtype = param_tensor.device, param_tensor.dtype
+
+        # 1) translation
+        t = param_tensor[:3]
+
+        # 2) quaternion → 단위 정규화
+        q = param_tensor[3:7]
+        q = q / (q.norm() + 1e-9)
+
+        # 2-1) quat → so(3) axis-angle
+        so3  = lietorch.SO3(q.unsqueeze(0))      # (1,4)
+        rvec = so3.log().squeeze(0)              # (3,)
+
+        # 3) log-scale σ (scale = 1 → σ = 0)
+        log_s = torch.zeros(1, device=device, dtype=dtype)
+
+        # 4) 7-D 벡터  [rx, ry, rz, tx, ty, tz, σ]
+        sim_vec = torch.cat([rvec, t, log_s], dim=0)  # (7,)
+
+        # 5) Sim3 생성  batch 차원 유지!
+        sim3 = lietorch.Sim3.exp(sim_vec.unsqueeze(0))  # shape == (1,)
+
+        return sim3          # squeeze(0) 하지 않음
+    
+
+    def track_vggt(self, frame: Frame, device):
         keyframe = self.keyframes.last_keyframe()
+
+        idx_f2k, _, _, _, _, _, _, _ = mast3r_match_asymmetric(
+            self.model, frame, keyframe, idx_i2j_init=self.idx_f2k
+        )
 
         """
         idx_f2k: 현재 프레임 포인트 → 키프레임 포인트 매칭 인덱스
@@ -194,7 +231,8 @@ class FrameTracker:
         """
         
         # images = load_and_preprocess_images_cv2([frame.img, keyframe.img]) 필요 없을 듯?
-        images = torch.cat([frame.img, keyframe.img], dim=0) # (2,3,H,W)
+        #print(frame.img.shape, keyframe.img.shape)
+        images = torch.cat([frame.img, keyframe.img.unsqueeze(0)], dim=0) # (2,3,H,W)
         
         
         with torch.no_grad():
@@ -223,7 +261,13 @@ class FrameTracker:
             W = frame.img.shape[3]
 
             # meshgrid를 이용해 모든 픽셀 좌표 (x, y)를 생성 (x: 열, y: 행)
-            grid_y, grid_x = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
+            stride = 4
+            grid_y, grid_x = torch.meshgrid(
+                torch.arange(0, H, stride, device=device),
+                torch.arange(0, W, stride, device=device),
+                indexing='ij'
+            )
+            #grid_y, grid_x = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
             # 두 grid를 스택하여 (H, W, 2) 형태의 텐서를 만든 후, (H*W, 2) 형태로 reshape
             all_query_points = torch.stack([grid_x, grid_y], dim=-1).reshape(-1, 2)
 
@@ -269,6 +313,7 @@ class FrameTracker:
                 
         # 카메로 포즈 자체가 현재 프레임 -> 월드 좌표
         T_CkCf = self.cam_param_to_sim3(pose_enc[0,1])
+        #print(T_CkCf.data.shape)
         frame.T_WC =   keyframe.T_WC * T_CkCf
         # T_WCf = T_WCk * T_CkCf
         # frame.T_WC = T_WCf
@@ -284,8 +329,11 @@ class FrameTracker:
         Xkf = einops.rearrange(Xkf_reduced, "b h w c -> b (h w) c")  # 결과: (1, H*W, 3)
         Ckf = einops.rearrange(Ckf_reduced, "b h w -> b (h w) 1")   # 결과: (1, H*W, 1)
 
+        #print(Xkf.shape)
         # Use pose to transform points to update keyframe
-        Xkk = T_CkCf.act(Xkf)
+        Xkk = T_CkCf.act(Xkf.squeeze(0)).unsqueeze(0)
+        #print(Xkf.squeeze(0).shape)
+        #Xkk = T_CkCf.act(Xkf.unsqueeze(0)).squeeze(0)   # (N, 3)
         
         keyframe.update_pointmap(Xkk, Ckf)
         

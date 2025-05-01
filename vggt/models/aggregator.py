@@ -49,7 +49,7 @@ class Aggregator(nn.Module):
 
     def __init__(
         self,
-        img_size=518,
+        img_size=448,#518,
         patch_size=14,
         embed_dim=1024,
         depth=24,

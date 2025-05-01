@@ -25,7 +25,6 @@ from mast3r_slam.visualization import WindowMsg, run_visualization
 import torch.multiprocessing as mp
 import time
 from vggt.models.vggt import VGGT
-from vggt.utils.load_fn import load_and_preprocess_images_cv2
 
 def relocalization(frame, keyframes, factor_graph, retrieval_database):
     """
@@ -320,19 +319,9 @@ if __name__ == "__main__":
         )
         frame = create_frame(i, img, T_WC, img_size=dataset.img_size, device=device)
 
-        # if mode == Mode.INIT:
-        #     # Initialize via mono inference, and encoded features neeed for database
-        #     X_init, C_init = mast3r_inference_mono(model, frame) # 한장의 이미지로부터 초기 3D 클라우드 + 신뢰도를 추론
-        #     frame.update_pointmap(X_init, C_init) # 해당 프레임에 3D 클라우드 + 신뢰도 업데이트
-        #     keyframes.append(frame)
-        #     states.queue_global_optimization(len(keyframes) - 1)
-        #     states.set_mode(Mode.TRACKING)
-        #     states.set_frame(frame)
-        #     i += 1
-        #     continue
         if mode == Mode.INIT:
             # Initialize via mono inference, and encoded features neeed for database
-            X_init, C_init = tracker.track_init(frame) # 한장의 이미지로부터 초기 3D 클라우드 + 신뢰도를 추론
+            X_init, C_init = mast3r_inference_mono(model, frame) # 한장의 이미지로부터 초기 3D 클라우드 + 신뢰도를 추론
             frame.update_pointmap(X_init, C_init) # 해당 프레임에 3D 클라우드 + 신뢰도 업데이트
             keyframes.append(frame)
             states.queue_global_optimization(len(keyframes) - 1)
@@ -340,9 +329,19 @@ if __name__ == "__main__":
             states.set_frame(frame)
             i += 1
             continue
+        # if mode == Mode.INIT:
+        #     # Initialize via mono inference, and encoded features neeed for database
+        #     X_init, C_init = tracker.track_init(frame) # 한장의 이미지로부터 초기 3D 클라우드 + 신뢰도를 추론
+        #     frame.update_pointmap(X_init, C_init) # 해당 프레임에 3D 클라우드 + 신뢰도 업데이트
+        #     keyframes.append(frame)
+        #     states.queue_global_optimization(len(keyframes) - 1)
+        #     states.set_mode(Mode.TRACKING)
+        #     states.set_frame(frame)
+        #     i += 1
+        #     continue
         
         if mode == Mode.TRACKING:
-            add_new_kf, match_info, try_reloc = tracker.track_vggt(frame, ) # 프레임 추적
+            add_new_kf, match_info, try_reloc = tracker.track_vggt(frame, device) # 프레임 추적
             # 여기서 New Keyframe 추가 여부, 매칭 정보, 재위치화 여부 결정
             """
             현재 프레임과 마지막 키프레임 간 3D 매칭 수행
@@ -355,12 +354,17 @@ if __name__ == "__main__":
                 states.set_mode(Mode.RELOC)
             states.set_frame(frame)
 
+        # elif mode == Mode.RELOC:
+        #     X, C = tracker.track_init(frame)
+        #     frame.update_pointmap(X, C)
+        #     states.set_frame(frame)
+        #     states.queue_reloc()
+
         elif mode == Mode.RELOC:
-            X, C = tracker.track_init(frame)
+            X, C = mast3r_inference_mono(model, frame)
             frame.update_pointmap(X, C)
             states.set_frame(frame)
             states.queue_reloc()
-
         # elif mode == Mode.RELOC:
         #     X, C = mast3r_inference_mono(model, frame)
         #     frame.update_pointmap(X, C)
