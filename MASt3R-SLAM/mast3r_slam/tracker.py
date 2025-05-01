@@ -183,7 +183,7 @@ class FrameTracker:
         sim3 = lietorch.Sim3(translation=t, rotation=q, scale=scale)
         return sim3
         
-    def track(self, frame: Frame, device, type: str):
+    def track_vggt(self, frame: Frame):
         keyframe = self.keyframes.last_keyframe()
 
         """

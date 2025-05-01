@@ -353,7 +353,7 @@ if __name__ == "__main__":
             continue
         
         if mode == Mode.TRACKING:
-            add_new_kf, match_info, try_reloc = tracker.track(frame) # 프레임 추적
+            add_new_kf, match_info, try_reloc = tracker.track_vggt(frame, ) # 프레임 추적
             # 여기서 New Keyframe 추가 여부, 매칭 정보, 재위치화 여부 결정
             """
             현재 프레임과 마지막 키프레임 간 3D 매칭 수행
