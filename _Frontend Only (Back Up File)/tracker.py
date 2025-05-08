@@ -11,15 +11,13 @@ from mast3r_slam.nonlinear_optimizer import check_convergence, huber
 from mast3r_slam.config import config
 from mast3r_slam.mast3r_utils import mast3r_match_asymmetric
 
-
-import torch
 import time
 from vggt.models.vggt import VGGT
 import einops
 import lietorch
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 from vggt.utils.geometry import unproject_depth_map_to_point_map
-
+import numpy as np
 
 class FrameTracker:
     def __init__(self, model, frames, device):
@@ -28,10 +26,8 @@ class FrameTracker:
         self.keyframes = frames
         self.device = device
         self.vggt = VGGT.from_pretrained("facebook/VGGT-1B").to(device)
-        
         self.reset_idx_f2k()
-
-
+        self.sec = True
     # Initialize with identity indexing of size (1,n)
     def reset_idx_f2k(self):
         self.idx_f2k = None
@@ -39,19 +35,9 @@ class FrameTracker:
     def track(self, frame: Frame):
         keyframe = self.keyframes.last_keyframe()
 
-        # 현재 프레임과 마지막 키프레임 간 모델 추론 수행
         idx_f2k, valid_match_k, Xff, Cff, Qff, Xkf, Ckf, Qkf = mast3r_match_asymmetric(
             self.model, frame, keyframe, idx_i2j_init=self.idx_f2k
-        ) 
-
-        """
-        idx_f2k: 현재 프레임 포인트 → 키프레임 포인트 매칭 인덱스
-        Xff, Xkf: 두 프레임에서 매칭된 3D 포인트들
-        Cff, Ckf: confidence
-        Qff, Qkf: descriptor confidence (정합성)
-        """
-        
-        
+        )
         # Save idx for next
         self.idx_f2k = idx_f2k.clone()
 
@@ -109,10 +95,13 @@ class FrameTracker:
                     K,
                     img_size,
                 )
+
         except Exception as e:
             print(f"Cholesky failed {frame.frame_id}")
             return False, [], True
-
+        
+        print("Mast3r : ",T_CkCf.data)
+        print("Mast3r-SLAM World : ",T_WCf.data)
         frame.T_WC = T_WCf
 
         # Use pose to transform points to update keyframe
@@ -146,7 +135,8 @@ class FrameTracker:
             ],
             False,
         )
-        
+
+
     def track_init(self, frame):
         with torch.no_grad():
             with torch.cuda.amp.autocast(dtype=torch.bfloat16):
@@ -165,6 +155,9 @@ class FrameTracker:
         
         Xff = einops.rearrange(Xff_reduced, "b h w c -> b (h w) c")  # 결과: (1, H*W, 3)
         Cff = einops.rearrange(Cff_reduced, "b h w -> b (h w) 1")   # 결과: (1, H*W, 1)
+        
+        
+
         return Xff, Cff
     
     '''
@@ -189,33 +182,198 @@ class FrameTracker:
         
     def cam_param_to_sim3(self, param_tensor):
         """
-        param_tensor: (9,) = [tx, ty, tz, qx, qy, qz, qw, I1, I2]
+        param_tensor : (9,)  = [tx, ty, tz, qx, qy, qz, qw, I1, I2]
+        returns      : lietorch.Sim3 object
         """
-        device, dtype = param_tensor.device, param_tensor.dtype
+        device, dtype = param_tensor.device, param_tensor.dtype   # same dev / type
 
-        # 1) translation
-        t = param_tensor[:3]
-
-        # 2) quaternion → 단위 정규화
+        # 1) translation (3,) and quaternion (4,)
+        t = param_tensor[0:3]
         q = param_tensor[3:7]
-        q = q / (q.norm() + 1e-9)
+        q = q / q.norm(p=2)            # keep it unit-length
 
-        # 2-1) quat → so(3) axis-angle
-        so3  = lietorch.SO3(q.unsqueeze(0))      # (1,4)
-        rvec = so3.log().squeeze(0)              # (3,)
+        # 2) global scale s = 1  —— put it **on the same device & dtype**
+        s = torch.ones(1, device=device, dtype=dtype)
 
-        # 3) log-scale σ (scale = 1 → σ = 0)
-        log_s = torch.zeros(1, device=device, dtype=dtype)
+        # 3) pack → (8,) → (1,8)
+        sim_vec = torch.cat((t, q, s), dim=0).unsqueeze(0)
 
-        # 4) 7-D 벡터  [rx, ry, rz, tx, ty, tz, σ]
-        sim_vec = torch.cat([rvec, t, log_s], dim=0)  # (7,)
+        # 4) Sim3 object (lietorch expects float32)
+        if sim_vec.dtype != torch.float32:
+            sim_vec = sim_vec.float()
+        return lietorch.Sim3.InitFromVec(sim_vec)
 
-        # 5) Sim3 생성  batch 차원 유지!
-        sim3 = lietorch.Sim3.exp(sim_vec.unsqueeze(0))  # shape == (1,)
 
-        return sim3          # squeeze(0) 하지 않음
-    
+    def track_vggt(self, frame: Frame, device):
+        ### depth 버전 ###
+        keyframe = self.keyframes.last_keyframe()
 
+        idx_f2k, _, _, _, _, _, _, _ = mast3r_match_asymmetric(
+            self.model, frame, keyframe, idx_i2j_init=self.idx_f2k
+        )
+
+        images = torch.cat([frame.img, keyframe.img.unsqueeze(0)], dim=0) # (2,3,H,W)
+        
+        if self.sec:
+            start = time.time()
+            
+        with torch.no_grad():
+            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                images = images[None]
+                aggregated_tokens_list, ps_idx = self.vggt.aggregator(images)
+                
+            
+            pose_enc = self.vggt.camera_head(aggregated_tokens_list)[-1]
+            depth_map, depth_conf = self.vggt.depth_head(aggregated_tokens_list, images, ps_idx)
+            
+            extrinsic, intrinsic = pose_encoding_to_extri_intri(pose_enc, images.shape[-2:])
+            point_map_by_unprojection = unproject_depth_map_to_point_map(depth_map.squeeze(0), 
+                                                                        extrinsic.squeeze(0), 
+                                                                        intrinsic.squeeze(0))     
+            
+            point_map = point_map_by_unprojection[None, ...]
+            if point_map.dtype != np.float32:
+                point_map = point_map.astype(np.float32)
+            point_map = torch.from_numpy(point_map)
+            point_map = point_map.to(device)
+            H = frame.img.shape[2]
+            W = frame.img.shape[3]
+
+            # meshgrid를 이용해 모든 픽셀 좌표 (x, y)를 생성 (x: 열, y: 행)
+            stride = 3  #6
+            grid_y, grid_x = torch.meshgrid(
+                torch.arange(0, H, stride, device=device),
+                torch.arange(0, W, stride, device=device),
+                indexing='ij'
+            )
+
+            all_query_points = torch.stack([grid_x, grid_y], dim=-1).reshape(-1, 2)
+
+            all_query_points = all_query_points[None]
+
+            track_list, vis_score, conf_score = self.vggt.track_head(aggregated_tokens_list, images, ps_idx, query_points=all_query_points)
+
+            track_list = track_list[-1][-1]
+            conf_score = conf_score[-1][1:]
+
+        if self.sec:   
+            print("VGGT 추론 시간 :",time.time()-start)
+            #self.sec=False
+        #print("추론 끝")
+        # Update keyframe pointmap after registration (need pose)
+        # predictions["world_points"] 형식은 (1, 3, H, W, 3)
+        # predictions["world_points_conf"] 형식은 (1, 3, H, W)
+        Xff_reduced = point_map[:,0,:,:,:]
+        
+
+        # predictions["world_points_conf"]: (1, 3, H, W)
+        # 첫 번째 요소 선택 → (1, H, W)
+        Cff_reduced = depth_conf[:, 0, :, :]
+
+        # 시스템이 기대하는 형식으로 재배열:
+        Xff = einops.rearrange(Xff_reduced, "b h w c -> b (h w) c")  # 결과: (1, H*W, 3)
+        Cff = einops.rearrange(Cff_reduced, "b h w -> b (h w) 1")   # 결과: (1, H*W, 1)
+
+        # 가정이다. Xff 는 자기 좌표계에서의 3D pointmap이다. 이때 자기 좌표계는 0,0,0,1, 0,0,0 이다.
+        frame.update_pointmap(Xff, Cff)
+
+        
+        valid_matches = conf_score > self.cfg["C_conf"]  # shape: (2, 3)
+
+        # 전체 유효 매칭 비율 계산
+        match_frac = valid_matches.float().mean()  # 모든 이미지와 query에 대한 평균
+        if match_frac < self.cfg["min_match_frac"]:
+            print(f"Skipped frame {frame.frame_id}")
+            return False, [], True
+
+        
+                
+        # 카메로 포즈 자체가 현재 프레임 -> 월드 좌표
+        T_CkCf = self.cam_param_to_sim3(pose_enc[0,1])
+        print("vggt :",T_CkCf.data)
+        #print(T_CkCf.data.shape)
+        frame.T_WC =   keyframe.T_WC * T_CkCf
+        # T_WCf = T_WCk * T_CkCf
+        # frame.T_WC = T_WCf
+        
+        
+        Xkf_reduced = point_map[:, 1, :, :, :]
+
+        # predictions["world_points_conf"]: (1, 3, H, W)
+        # 첫 번째 요소 선택 → (1, H, W)
+        Ckf_reduced = depth_conf[:, 1, :, :]
+
+        # 시스템이 기대하는 형식으로 재배열:
+        Xkf = einops.rearrange(Xkf_reduced, "b h w c -> b (h w) c")  # 결과: (1, H*W, 3)
+        Ckf = einops.rearrange(Ckf_reduced, "b h w -> b (h w) 1")   # 결과: (1, H*W, 1)
+
+        #print(Xkf.shape)
+        # Use pose to transform points to update keyframe
+        Xkk = T_CkCf.act(Xkf.squeeze(0)).unsqueeze(0)
+        #print(Xkf.squeeze(0).shape)
+        #Xkk = T_CkCf.act(Xkf.unsqueeze(0)).squeeze(0)   # (N, 3)
+        
+        keyframe.update_pointmap(Xkk, Ckf)
+        
+        
+        # write back the fitered pointmap
+        self.keyframes[len(self.keyframes) - 1] = keyframe
+        # print(str(len(self.keyframes)) + "진행 중")
+        """
+        ToDo
+        
+        vggt tracking 활성화 및 무엇을 반환하는지 확인
+        결국 Matching 정보를 활용해야하는데 vggt을 통해 matching 정보를 어떻게 얻을지 확인
+        
+        """
+        valid_kf = valid_matches[0]  # shape: (3,) → 키프레임의 3개 query에 대해 True/False
+
+        # 유효 매칭 수와 비율
+        n_valid = valid_kf.float().sum()
+        match_frac_k = n_valid / valid_kf.numel()  # 키프레임 쪽의 유효한 매칭 비율
+
+        # 고유한 키프레임 픽셀의 수를 계산합니다.
+        # track_list의 shape는 (2, 3, 2)에서, 키프레임 좌표는 track_list[1] (shape: (3, 2))
+        keyframe_points = track_list[1]  # 각 query의 (x,y) 좌표
+
+        # 유효한 매칭에 해당하는 키프레임 좌표 선택
+        valid_keyframe_points = keyframe_points[valid_kf]  # (N_valid, 2)
+
+        # 픽셀 좌표는 소수점 값을 가질 수 있으므로, 정수 단위(반올림 후)를 사용해 고유 픽셀 수를 계산
+        unique_pixels = torch.unique(valid_keyframe_points.round(), dim=0)
+        unique_frac_f = unique_pixels.shape[0] / valid_kf.numel()
+
+        # 최종적으로, 두 비율 중 낮은 값이 기준(self.cfg["match_frac_thresh"]) 미만이면 새로운 keyframe을 선택
+        new_kf = min(match_frac_k, unique_frac_f) < self.cfg["match_frac_thresh"]
+        print(min(match_frac_k, unique_frac_f))
+
+        # # Keyframe selection
+        # n_valid = valid_kf.sum()
+        # match_frac_k = n_valid / valid_kf.numel()
+        # unique_frac_f = (
+        #     torch.unique(idx_f2k[valid_match_k[:, 0]]).shape[0] / valid_kf.numel()
+        # )
+
+        # new_kf = min(match_frac_k, unique_frac_f) < self.cfg["match_frac_thresh"]
+
+        # Rest idx if new keyframe
+        if new_kf:
+            self.reset_idx_f2k()
+
+        return (
+            new_kf,
+            [
+                keyframe.X_canon,
+                keyframe.get_average_conf(),
+                frame.X_canon,
+                frame.get_average_conf(),
+                #Qkf,
+                #Qff,
+            ],
+            False,
+        )
+
+    '''
     def track_vggt(self, frame: Frame, device):
         keyframe = self.keyframes.last_keyframe()
 
@@ -234,7 +392,9 @@ class FrameTracker:
         #print(frame.img.shape, keyframe.img.shape)
         images = torch.cat([frame.img, keyframe.img.unsqueeze(0)], dim=0) # (2,3,H,W)
         
-        
+        if self.sec:
+            start = time.time()
+            
         with torch.no_grad():
             with torch.cuda.amp.autocast(dtype=torch.bfloat16):
                 images = images[None]
@@ -250,7 +410,7 @@ class FrameTracker:
 
             # Predict Point Maps
             point_map, point_conf = self.vggt.point_head(aggregated_tokens_list, images, ps_idx)
-                
+            
             # Construct 3D Points from Depth Maps and Cameras
             # which usually leads to more accurate 3D points than point map branch
             #point_map_by_unprojection = unproject_depth_map_to_point_map(depth_map.squeeze(0), 
@@ -261,7 +421,7 @@ class FrameTracker:
             W = frame.img.shape[3]
 
             # meshgrid를 이용해 모든 픽셀 좌표 (x, y)를 생성 (x: 열, y: 행)
-            stride = 4
+            stride = 6
             grid_y, grid_x = torch.meshgrid(
                 torch.arange(0, H, stride, device=device),
                 torch.arange(0, W, stride, device=device),
@@ -280,9 +440,10 @@ class FrameTracker:
             #conf score은 (1,2,3) 형태이다. 2는 2개의 이미지, 3은 3개의 query이다.
             track_list = track_list[-1][-1]
             conf_score = conf_score[-1][1:]
-            
-       
-
+        if self.sec:   
+            print("VGGT 추론 시간 :",time.time()-start)
+            #self.sec=False
+        #print("추론 끝")
         # Update keyframe pointmap after registration (need pose)
         # predictions["world_points"] 형식은 (1, 3, H, W, 3)
         # predictions["world_points_conf"] 형식은 (1, 3, H, W)
@@ -313,6 +474,7 @@ class FrameTracker:
                 
         # 카메로 포즈 자체가 현재 프레임 -> 월드 좌표
         T_CkCf = self.cam_param_to_sim3(pose_enc[0,1])
+        print("vggt :",T_CkCf.data)
         #print(T_CkCf.data.shape)
         frame.T_WC =   keyframe.T_WC * T_CkCf
         # T_WCf = T_WCk * T_CkCf
@@ -340,7 +502,7 @@ class FrameTracker:
         
         # write back the fitered pointmap
         self.keyframes[len(self.keyframes) - 1] = keyframe
-
+        # print(str(len(self.keyframes)) + "진행 중")
         """
         ToDo
         
@@ -367,7 +529,7 @@ class FrameTracker:
 
         # 최종적으로, 두 비율 중 낮은 값이 기준(self.cfg["match_frac_thresh"]) 미만이면 새로운 keyframe을 선택
         new_kf = min(match_frac_k, unique_frac_f) < self.cfg["match_frac_thresh"]
-
+        print(min(match_frac_k, unique_frac_f))
 
         # # Keyframe selection
         # n_valid = valid_kf.sum()
@@ -394,7 +556,8 @@ class FrameTracker:
             ],
             False,
         )
-
+    
+    '''
     def get_points_poses(self, frame, keyframe, idx_f2k, img_size, use_calib, K=None):
         Xf = frame.X_canon
         Xk = keyframe.X_canon

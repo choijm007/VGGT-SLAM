@@ -34,7 +34,7 @@ class FactorGraph:
         self.Q_jj2ii = torch.as_tensor([], dtype=torch.float32, device=self.device)
         self.window_size = self.cfg["window_size"]
 
-        self.vggt = VGGT.from_pretrained("facebook/VGGT-1B").to(device)
+        #self.vggt = VGGT.from_pretrained("facebook/VGGT-1B").to(device)
 
         self.K = K
 
@@ -168,7 +168,7 @@ class FactorGraph:
         # Update the keyframe T_WC
         self.frames.update_T_WCs(T_WCs[pin:], unique_kf_idx[pin:])
 
-    '''
+    
     def solve_GN_calib(self):
         K = self.K
         pin = self.cfg["pin"]
@@ -223,10 +223,10 @@ class FactorGraph:
 
         # Update the keyframe T_WC
         self.frames.update_T_WCs(T_WCs[pin:], unique_kf_idx[pin:])
-    '''
-
     
-    def solve_with_VGGT_and_GN_calib(self):
+
+    '''
+    def solve_GN_calib(self):
         K = self.K
         pin = self.cfg["pin"]
         unique_kf_idx = self.get_unique_kf_idx()
@@ -259,14 +259,17 @@ class FactorGraph:
 
         pose_mast3r = torch.cat([q_xyz, qw, t_xyz, log_s], dim=-1)
 
-        #print(f"pose_mast3r.data : {pose_mast3r.data.shape}")      #(1, 2, 8)
+        #print(pose_mast3r.data.shape)
         #print(pose_mast3r.data)
-
-        pose_mast3r.data = pose_mast3r.data.squeeze(0).unsqueeze(1) #(2, 1, 8)
-
-        #print(f"pose_mast3r.data : {pose_mast3r.data.shape}")
+        #temp = pose_mast3r.data.shape[1]
+        #print(pose_mast3r)
+        #print(pose_mast3r.shape)
+        pose_mast3r.data = pose_mast3r.data[:, -1, :].unsqueeze(0)
+        #print(pose_mast3r.data.shape)
         #print(pose_mast3r.data)
+        #print(unique_kf_idx)
+        #pose_mast3r = pose_mast3r.unsqueeze(1)
 
-        #self.frames.update_T_WCs(pose_mast3r, unique_kf_idx[-1:])         # T_WCs[pin:] => Shape : [S, 8]
-        self.frames.update_T_WCs_all(pose_mast3r, unique_kf_idx[-1:])      # [ qx, qy, qz, qw, tx, ty, tz, log_s ]
-    
+        self.frames.update_T_WCs(pose_mast3r, unique_kf_idx[-1:])         # T_WCs[pin:] => Shape : [S, 8]
+                                                                        # [ qx, qy, qz, qw, tx, ty, tz, log_s ]
+    '''

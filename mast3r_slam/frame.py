@@ -310,11 +310,6 @@ class SharedKeyframes:
         with self.lock:
             self.T_WC[idx] = T_WCs.data
 
-    def update_T_WCs_all(self, T_WCs, idx) -> None:
-        with self.lock:
-            for i in range(idx + 1):
-                self.T_WC[i] = T_WCs.data[i]
-
     def get_dirty_idx(self):
         with self.lock:
             idx = torch.where(self.is_dirty)[0]
