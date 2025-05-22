@@ -18,12 +18,13 @@ from mast3r_slam.mast3r_utils import (
     load_mast3r,
     load_retriever,
     mast3r_inference_mono,
+    vggt_inference_mono,
 )
 from mast3r_slam.multiprocess_utils import new_queue, try_get_msg
 from mast3r_slam.tracker import FrameTracker
 from mast3r_slam.visualization import WindowMsg, run_visualization
 import torch.multiprocessing as mp
-
+from vggt.models.vggt import VGGT
 
 def relocalization(frame, keyframes, factor_graph, retrieval_database):
     # we are adding and then removing from the keyframe, so we need to be careful.
@@ -47,6 +48,7 @@ def relocalization(frame, keyframes, factor_graph, retrieval_database):
             if factor_graph.add_factors(
                 frame_idx,
                 kf_idx,
+                device,
                 config["reloc"]["min_match_frac"],
                 is_reloc=config["reloc"]["strict"],
             ):
@@ -114,7 +116,7 @@ def run_backend(states, keyframes):
     frame_idx = [idx] * len(kf_idx)
     if kf_idx:
         factor_graph.add_factors(
-            kf_idx, frame_idx, config["local_opt"]["min_match_frac"]
+            kf_idx, frame_idx, device,config["local_opt"]["min_match_frac"]
         )
 
     with states.lock:
@@ -183,7 +185,9 @@ if __name__ == "__main__":
         viz.start()
 
     model = load_mast3r(device=device)
+    vggt = VGGT.from_pretrained("facebook/VGGT-1B").to(device)
     model.share_memory()
+    vggt.share_memory()
 
     has_calib = dataset.has_calib()
     use_calib = config["use_calib"]
@@ -208,10 +212,10 @@ if __name__ == "__main__":
         if recon_file.exists():
             recon_file.unlink()
 
-    tracker = FrameTracker(model, keyframes, device)
+    tracker = FrameTracker(model, vggt,keyframes, device)
     last_msg = WindowMsg()
 
-    factor_graph = FactorGraph(model, keyframes, K, device)
+    factor_graph = FactorGraph(model, vggt, keyframes, K, device)
     retrieval_database = load_retriever(model)
 
     i = 0
@@ -253,8 +257,9 @@ if __name__ == "__main__":
 
         if mode == Mode.INIT:
             # Initialize via mono inference, and encoded features neeed for database
-            _, _ = mast3r_inference_mono(model, frame)
-            X_init, C_init = tracker.track_init(frame)
+
+            X_init, C_init = vggt_inference_mono(vggt, device,frame)
+            mast3r_inference_mono(model, frame)
             frame.update_pointmap(X_init, C_init)
             keyframes.append(frame)
             states.queue_global_optimization(len(keyframes) - 1)
@@ -264,9 +269,11 @@ if __name__ == "__main__":
             continue
 
         if mode == Mode.TRACKING:
-            add_new_kf, match_info, try_reloc = tracker.track_vggt(frame, device) # 프레임 추적
+            add_new_kf, match_info, try_reloc = tracker.track_vggt_v2(frame, device) # 프레임 추적
             #add_new_kf, match_info, try_reloc = tracker.track(frame)
             # 여기서 New Keyframe 추가 여부, 매칭 정보, 재위치화 여부 결정
+            
+            # print("Tracking!")
             """
             현재 프레임과 마지막 키프레임 간 3D 매칭 수행
             현재 카메라 위치 (T_WC) 추정
@@ -279,8 +286,9 @@ if __name__ == "__main__":
             states.set_frame(frame)
 
         elif mode == Mode.RELOC:
-            X, C = mast3r_inference_mono(model, frame)
-            X, C = tracker.track_init(frame)
+            
+            X, C = vggt_inference_mono(vggt, device,frame)
+            mast3r_inference_mono(model, frame)
             frame.update_pointmap(X, C)
             states.set_frame(frame)
             states.queue_reloc()

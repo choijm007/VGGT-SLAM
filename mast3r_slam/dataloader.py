@@ -22,7 +22,7 @@ class MonocularDataset(torch.utils.data.Dataset):
         self.dtype = dtype
         self.rgb_files = []
         self.timestamps = []
-        self.img_size = 512
+        self.img_size = 448
         self.camera_intrinsics = None
         self.use_calibration = config["use_calib"]
         self.save_results = True

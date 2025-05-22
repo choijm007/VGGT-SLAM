@@ -5,13 +5,14 @@ from mast3r_slam.frame import SharedKeyframes
 from mast3r_slam.geometry import (
     constrain_points_to_ray,
 )
-from mast3r_slam.mast3r_utils import mast3r_match_symmetric
+from mast3r_slam.mast3r_utils import mast3r_match_symmetric, vggt_match_symmetric
 import mast3r_slam_backends
 
 
 class FactorGraph:
-    def __init__(self, model, frames: SharedKeyframes, K=None, device="cuda"):
+    def __init__(self, model, vggt,frames: SharedKeyframes, K=None, device="cuda"):
         self.model = model
+        self.vggt = vggt
         self.frames = frames
         self.device = device
         self.cfg = config["local_opt"]
@@ -27,7 +28,7 @@ class FactorGraph:
 
         self.K = K
 
-    def add_factors(self, ii, jj, min_match_frac, is_reloc=False):
+    def add_factors(self, ii, jj, device,min_match_frac, is_reloc=False):
         kf_ii = [self.frames[idx] for idx in ii]
         kf_jj = [self.frames[idx] for idx in jj]
         feat_i = torch.cat([kf_i.feat for kf_i in kf_ii])
@@ -36,7 +37,26 @@ class FactorGraph:
         pos_j = torch.cat([kf_j.pos for kf_j in kf_jj])
         shape_i = [kf_i.img_true_shape for kf_i in kf_ii]
         shape_j = [kf_j.img_true_shape for kf_j in kf_jj]
-
+        # for i,k in enumerate(kf_ii):
+        #     print("kf_ii", i,k.img.shape)
+        # for i,j in enumerate(kf_jj):
+        #     print("kf_jj",i,j.img.shape)
+        frame_i = torch.cat([kf_i.img[None] for kf_i in kf_ii])
+        frame_j = torch.cat([kf_i.img[None] for kf_i in kf_jj])
+        #frame_c = torch.cat(kf_ii[0].img, kf_jj[0].img)
+        # print(frame_i.shape, frame_j.shape)
+        # (
+        #     _,
+        #     _,
+        #     _,
+        #     _,
+        #     Qii,
+        #     Qjj,
+        #     Qji,
+        #     Qij,
+        # ) = mast3r_match_symmetric(
+        #     self.model, feat_i, pos_i, feat_j, pos_j, shape_i, shape_j
+        # )
         (
             idx_i2j,
             idx_j2i,
@@ -46,8 +66,8 @@ class FactorGraph:
             Qjj,
             Qji,
             Qij,
-        ) = mast3r_match_symmetric(
-            self.model, feat_i, pos_i, feat_j, pos_j, shape_i, shape_j
+        ) = vggt_match_symmetric(
+            self.model,self.vggt,device,  feat_i, pos_i, feat_j, pos_j,shape_i, shape_j,frame_i, frame_j
         )
 
         batch_inds = torch.arange(idx_i2j.shape[0], device=idx_i2j.device)[

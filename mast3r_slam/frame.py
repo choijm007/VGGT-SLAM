@@ -108,7 +108,8 @@ class Frame:
         return self.C / self.N if self.C is not None else None
 
 
-def create_frame(i, img, T_WC, img_size=560, device="cuda:0"):
+def create_frame(i, img, T_WC, img_size=448, device="cuda:0"):
+    #print(img_size)
     img = resize_img(img, img_size)
     rgb = img["img"].to(device=device)
     img_shape = torch.tensor(img["true_shape"], device=device)
