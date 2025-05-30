@@ -18,34 +18,15 @@ from mast3r_slam.mast3r_utils import (
     load_mast3r,
     load_retriever,
     mast3r_inference_mono,
+    vggt_inference_mono,
 )
 from mast3r_slam.multiprocess_utils import new_queue, try_get_msg
 from mast3r_slam.tracker import FrameTracker
 from mast3r_slam.visualization import WindowMsg, run_visualization
 import torch.multiprocessing as mp
-import time
 from vggt.models.vggt import VGGT
 
 def relocalization(frame, keyframes, factor_graph, retrieval_database):
-    """
-    현재 프레임을 사용해 카메라 위치를 재조정(relocalize)하는 함수입니다.
-    
-    1. retrieval_database를 사용해 현재 프레임과 유사한 키프레임들을 검색합니다.
-    2. 유사한 키프레임이 있으면 일시적으로 현재 프레임을 키프레임으로 추가합니다.
-    3. factor_graph를 통해 이 프레임과 기존 키프레임 사이의 관계를 계산합니다.
-    4. 관계가 충분히 강하면(매칭이 성공하면) 현재 프레임을 데이터베이스에 추가하고 위치를 업데이트합니다.
-    5. 매칭이 실패하면 키프레임에서 제거합니다.
-    6. 성공적인 재위치화 후에는 전체 그래프를 최적화합니다.
-    
-    Args:
-        frame: 현재 프레임
-        keyframes: 키프레임 모음
-        factor_graph: 키프레임 간의 관계를 나타내는 그래프
-        retrieval_database: 키프레임 검색 데이터베이스
-    
-    Returns:
-        bool: 재위치화 성공 여부
-    """
     # we are adding and then removing from the keyframe, so we need to be careful.
     # The lock slows viz down but safer this way...
     with keyframes.lock:
@@ -67,6 +48,7 @@ def relocalization(frame, keyframes, factor_graph, retrieval_database):
             if factor_graph.add_factors(
                 frame_idx,
                 kf_idx,
+                device,
                 config["reloc"]["min_match_frac"],
                 is_reloc=config["reloc"]["strict"],
             ):
@@ -91,25 +73,7 @@ def relocalization(frame, keyframes, factor_graph, retrieval_database):
         return successful_loop_closure
 
 
-#def run_backend(cfg, model, states, keyframes, K):
 def run_backend(states, keyframes):
-    """
-    SLAM 시스템의 백엔드 프로세스를 실행하는 함수입니다.
-    
-    1. 팩터 그래프와 검색 데이터베이스를 초기화합니다.
-    2. 시스템의 모드(초기화, 트래킹, 재위치화 등)에 따라 다른 처리를 수행합니다.
-    3. 재위치화 요청이 있으면 relocalization 함수를 호출합니다.
-    4. 키프레임이 추가되면 해당 키프레임과 기존 키프레임 간의 관계를 계산합니다.
-    5. 루프 클로저 감지 및 처리를 수행합니다.
-    6. 그래프 최적화를 수행하여 카메라 위치를 보정합니다.
-    
-    Args:
-        cfg: 설정 정보
-        model: MAST3R 신경망 모델
-        states: 공유 상태 정보
-        keyframes: 키프레임 모음
-        K: 카메라 내부 파라미터(intrinsics)
-    """
     mode = states.get_mode()
     if mode == Mode.INIT or states.is_paused():
         return
@@ -139,16 +103,6 @@ def run_backend(states, keyframes):
         k=config["retrieval"]["k"],
         min_thresh=config["retrieval"]["min_thresh"],
     )
-    """
-    retrieval DB를 통해 유사한 오래된 키프레임들을 검색
-
-    add_after_query=True: 검색 끝난 후 해당 프레임을 DB에 추가
-
-    retrieval_inds: loop closure 후보 키프레임 인덱스들
-
-    kf_idx에 합쳐서 정합 대상으로 확장
-    """
-        
     kf_idx += retrieval_inds
 
     lc_inds = set(retrieval_inds)
@@ -162,7 +116,7 @@ def run_backend(states, keyframes):
     frame_idx = [idx] * len(kf_idx)
     if kf_idx:
         factor_graph.add_factors(
-            kf_idx, frame_idx, config["local_opt"]["min_match_frac"]
+            kf_idx, frame_idx, device,config["local_opt"]["min_match_frac"]
         )
 
     with states.lock:
@@ -180,23 +134,7 @@ def run_backend(states, keyframes):
 
 
 if __name__ == "__main__":
-    """
-    MAST3R SLAM 시스템의 메인 함수입니다.
-    
-    1. 멀티프로세싱 설정 및 GPU 설정을 초기화합니다.
-    2. 명령줄 인자를 파싱하여 설정과 데이터셋을 로드합니다.
-    3. 시각화, 백엔드 처리를 위한 멀티프로세스를 시작합니다.
-    4. 데이터셋의 각 프레임에 대해:
-       - 적절한 모드(초기화, 트래킹, 재위치화)에서 처리합니다.
-       - 필요시 키프레임을 추가하고 글로벌 최적화를 요청합니다.
-    5. 완료 후 결과(궤적, 3D 재구성, 키프레임)를 저장합니다.
-    
-    주요 모드:
-    - INIT: 시스템 초기화, 첫 번째 키프레임 설정
-    - TRACKING: 현재 프레임의 카메라 위치 추적
-    - RELOC: 추적 실패 시 재위치화 시도
-    """
-    mp.set_start_method("spawn") 
+    mp.set_start_method("spawn")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.set_grad_enabled(False)
     device = "cuda:0"
@@ -216,18 +154,18 @@ if __name__ == "__main__":
     print(args.dataset)
     print(config)
 
-    manager = mp.Manager() # 메모리 공유 관리자 생성
-    main2viz = new_queue(manager, args.no_viz) # 메인 프로세스에서 시각화 프로세스로 메시지 전달
-    viz2main = new_queue(manager, args.no_viz) # 시각화 프로세스에서 메인 프로세스로 메시지 전달   
+    manager = mp.Manager()
+    main2viz = new_queue(manager, args.no_viz)
+    viz2main = new_queue(manager, args.no_viz)
 
-    dataset = load_dataset(args.dataset) # 데이터셋 로드
-    dataset.subsample(config["dataset"]["subsample"]) # 하위 샘플링
-    h, w = dataset.get_img_shape()[0] # 이미지 크기
+    dataset = load_dataset(args.dataset)
+    dataset.subsample(config["dataset"]["subsample"])
+    h, w = dataset.get_img_shape()[0]
 
     if args.calib:
         with open(args.calib, "r") as f:
-            intrinsics = yaml.load(f, Loader=yaml.SafeLoader) # 캘리브레이션 파일 로드
-        config["use_calib"] = True # 캘리브레이션 사용
+            intrinsics = yaml.load(f, Loader=yaml.SafeLoader)
+        config["use_calib"] = True
         dataset.use_calibration = True
         dataset.camera_intrinsics = Intrinsics.from_calib(
             dataset.img_size,
@@ -236,8 +174,8 @@ if __name__ == "__main__":
             intrinsics["calibration"],
         )
 
-    keyframes = SharedKeyframes(manager, h, w) # 키프레임 공유 메모리 객체
-    states = SharedStates(manager, h, w) # 상태 공유 메모리 객체
+    keyframes = SharedKeyframes(manager, h, w)
+    states = SharedStates(manager, h, w)
 
     if not args.no_viz:
         viz = mp.Process(
@@ -246,11 +184,10 @@ if __name__ == "__main__":
         )
         viz.start()
 
-    model = load_mast3r(device=device) # 모델 로드
-    model.share_memory() # 모델 공유 메모리 할당
-    
-    # VGGT 모델 로드
-    # vggt = VGGT.from_pretrained("facebook/VGGT-1B").to(device)
+    model = load_mast3r(device=device)
+    vggt = VGGT.from_pretrained("facebook/VGGT-1B").to(device)
+    model.share_memory()
+    vggt.share_memory()
 
     has_calib = dataset.has_calib()
     use_calib = config["use_calib"]
@@ -274,11 +211,11 @@ if __name__ == "__main__":
             traj_file.unlink()
         if recon_file.exists():
             recon_file.unlink()
-    
-    tracker = FrameTracker(model, keyframes, device)
+
+    tracker = FrameTracker(model, vggt,keyframes, device)
     last_msg = WindowMsg()
 
-    factor_graph = FactorGraph(model, keyframes, K, device)
+    factor_graph = FactorGraph(model, vggt, keyframes, K, device)
     retrieval_database = load_retriever(model)
 
     i = 0
@@ -306,12 +243,11 @@ if __name__ == "__main__":
             states.set_mode(Mode.TERMINATED)
             break
 
-        timestamp, img = dataset[i] # 프레임 로드
+        timestamp, img = dataset[i]
         if save_frames:
             frames.append(img)
 
         # get frames last camera pose
-        # 초기 프레임이면 단위 행렬, 그렇지 않으면 마지막 프레임의 행렬
         T_WC = (
             lietorch.Sim3.Identity(1, device=device)
             if i == 0
@@ -321,28 +257,23 @@ if __name__ == "__main__":
 
         if mode == Mode.INIT:
             # Initialize via mono inference, and encoded features neeed for database
-            X_init, C_init = mast3r_inference_mono(model, frame) # 한장의 이미지로부터 초기 3D 클라우드 + 신뢰도를 추론
-            frame.update_pointmap(X_init, C_init) # 해당 프레임에 3D 클라우드 + 신뢰도 업데이트
+
+            X_init, C_init = vggt_inference_mono(vggt, device,frame)
+            mast3r_inference_mono(model, frame)
+            frame.update_pointmap(X_init, C_init)
             keyframes.append(frame)
             states.queue_global_optimization(len(keyframes) - 1)
             states.set_mode(Mode.TRACKING)
             states.set_frame(frame)
             i += 1
             continue
-        # if mode == Mode.INIT:
-        #     # Initialize via mono inference, and encoded features neeed for database
-        #     X_init, C_init = tracker.track_init(frame) # 한장의 이미지로부터 초기 3D 클라우드 + 신뢰도를 추론
-        #     frame.update_pointmap(X_init, C_init) # 해당 프레임에 3D 클라우드 + 신뢰도 업데이트
-        #     keyframes.append(frame)
-        #     states.queue_global_optimization(len(keyframes) - 1)
-        #     states.set_mode(Mode.TRACKING)
-        #     states.set_frame(frame)
-        #     i += 1
-        #     continue
-        
+
         if mode == Mode.TRACKING:
-            add_new_kf, match_info, try_reloc = tracker.track_vggt(frame, device) # 프레임 추적
+            add_new_kf, match_info, try_reloc = tracker.track_vggt_v2(frame, device) # 프레임 추적
+            #add_new_kf, match_info, try_reloc = tracker.track(frame)
             # 여기서 New Keyframe 추가 여부, 매칭 정보, 재위치화 여부 결정
+            
+            # print("Tracking!")
             """
             현재 프레임과 마지막 키프레임 간 3D 매칭 수행
             현재 카메라 위치 (T_WC) 추정
@@ -354,32 +285,18 @@ if __name__ == "__main__":
                 states.set_mode(Mode.RELOC)
             states.set_frame(frame)
 
-        # elif mode == Mode.RELOC:
-        #     X, C = tracker.track_init(frame)
-        #     frame.update_pointmap(X, C)
-        #     states.set_frame(frame)
-        #     states.queue_reloc()
-
         elif mode == Mode.RELOC:
-            X, C = mast3r_inference_mono(model, frame)
+            
+            X, C = vggt_inference_mono(vggt, device,frame)
+            mast3r_inference_mono(model, frame)
             frame.update_pointmap(X, C)
             states.set_frame(frame)
             states.queue_reloc()
-        # elif mode == Mode.RELOC:
-        #     X, C = mast3r_inference_mono(model, frame)
-        #     frame.update_pointmap(X, C)
-        #     states.set_frame(frame)
-        #     states.queue_reloc()
-        #     # In single threaded mode, make sure relocalization happen for every frame
-        #     while config["single_thread"]:
-        #         with states.lock:
-        #             if states.reloc_sem.value == 0:
-        #                 break
-        #         time.sleep(0.01)
         else:
             raise Exception("Invalid mode")
-
+        print(i)
         if add_new_kf:
+            print("NEW Keyframe! ",i,len(keyframes))
             keyframes.append(frame)
             states.queue_global_optimization(len(keyframes) - 1)
 
@@ -412,6 +329,5 @@ if __name__ == "__main__":
             cv2.imwrite(f"{savedir}/{i}.png", frame)
 
     print("done")
-    #backend.join()
     if not args.no_viz:
         viz.join()

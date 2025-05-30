@@ -1,15 +1,18 @@
 #!/bin/bash
+
+export CUDA_LAUNCH_BLOCKING=1
+
 dataset_path="datasets/tum/"
 datasets=(
-    rgbd_dataset_freiburg1_360
+    #rgbd_dataset_freiburg1_360
     rgbd_dataset_freiburg1_desk
-    rgbd_dataset_freiburg1_desk2
-    rgbd_dataset_freiburg1_floor
-    rgbd_dataset_freiburg1_plant
-    rgbd_dataset_freiburg1_room
-    rgbd_dataset_freiburg1_rpy
-    rgbd_dataset_freiburg1_teddy
-    rgbd_dataset_freiburg1_xyz
+    #rgbd_dataset_freiburg1_desk2
+    #rgbd_dataset_freiburg1_floor
+    #rgbd_dataset_freiburg1_plant
+    #rgbd_dataset_freiburg1_room
+    #rgbd_dataset_freiburg1_rpy
+    #rgbd_dataset_freiburg1_teddy
+    #rgbd_dataset_freiburg1_xyz
 )
 
 no_calib=false

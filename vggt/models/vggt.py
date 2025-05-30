@@ -12,6 +12,8 @@ from vggt.models.aggregator import Aggregator
 from vggt.heads.camera_head import CameraHead
 from vggt.heads.dpt_head import DPTHead
 from vggt.heads.track_head import TrackHead
+from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+from vggt.utils.geometry import unproject_depth_map_to_point_map
 
 
 class VGGT(nn.Module, PyTorchModelHubMixin):

@@ -77,6 +77,8 @@ def activate_head(out, activation="norm_exp", conf_activation="expp1"):
     xyz = fmap[:, :, :, :-1]
     conf = fmap[:, :, :, -1]
 
+    #print(conf)
+
     if activation == "norm_exp":
         d = xyz.norm(dim=-1, keepdim=True).clamp(min=1e-8)
         xyz_normed = xyz / d

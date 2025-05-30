@@ -52,9 +52,20 @@ class TrackHead(nn.Module):
             patch_size=patch_size,
             features=features,
             feature_only=True,  # Only output features, no activation
-            down_ratio=2,  # Reduces spatial dimensions by factor of 2
+            down_ratio=1,  # Reduces spatial dimensions by factor of 2   # => 1 로 하면 감당 불가능 (GPU 메모리 부족)
             pos_embed=False,
         )
+
+        '''
+        self.feature_confidence_extractor = DPTHead(
+            dim_in=dim_in,
+            patch_size=patch_size,
+            features=features,
+            feature_only=False,  # Only output features, no activation
+            down_ratio=2,  # Reduces spatial dimensions by factor of 2  # => 1 로 하면 감당 불가능 (GPU 메모리 부족)
+            pos_embed=False,
+        )
+        '''
 
         # Tracker module that predicts point trajectories
         # Takes feature maps and predicts coordinates and visibility
